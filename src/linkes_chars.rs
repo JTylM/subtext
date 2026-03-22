@@ -1,11 +1,53 @@
 #[derive(Clone)]
-struct CharNode {
+pub struct CharNode {
     pub c: char,
     next: Option<usize>, // index into arena of a LinkedChars object
 }
 
 pub struct LinkedChars {
     arena: Vec<CharNode>, // the node at index 0 (the root) is not considered part of the content
+}
+
+pub struct LinkedCharsIter<'a> {
+    linked_chars: &'a LinkedChars,
+    idx: usize,
+}
+
+impl<'a> Iterator for LinkedCharsIter<'a> {
+    type Item = &'a CharNode;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(new_idx) = self.linked_chars.get(self.idx).next {
+            self.idx = new_idx;
+            Some(self.linked_chars.get(new_idx))
+        } else {
+            None
+        }
+    }
+}
+
+pub struct LinkedCharsOwnedIter {
+    linked_chars: LinkedChars,
+    idx: usize,
+}
+
+impl Iterator for LinkedCharsOwnedIter {
+    type Item = CharNode;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(new_idx) = self.linked_chars.arena[self.idx].next {
+            self.idx = new_idx;
+            let dummy_node = CharNode {
+                c: '\0',
+                next: None,
+            };
+            let owned_node = std::mem::replace(&mut self.linked_chars.arena[new_idx], dummy_node);
+
+            Some(owned_node)
+        } else {
+            None
+        }
+    }
 }
 
 impl CharNode {
@@ -56,17 +98,30 @@ impl LinkedChars {
         if linked_chars.is_empty() {
             return;
         }
-        // init this to 0 so we will add the .next of the root node in the next step
-        let node_to_add_idx = 0;
         // pretend we just added the node at start_index
         let last_node_added_idx = start_idx;
-        // if there is one, pick the next node from linked_chars
-        while let Some(node_to_add_idx) = linked_chars.get(node_to_add_idx).next {
-            self.arena.push(linked_chars.get(node_to_add_idx).clone());
+        for new_node in linked_chars.into_iter_with_start(0) {
+            self.arena.push(new_node);
             // the .node just added should be the .next of the last node added
             // the index of the just pushed node is len-1
             self.get_mut(last_node_added_idx).next = Some(self.arena.len() - 1);
         }
         self.arena.last_mut().unwrap().next = Some(end_idx);
+    }
+
+    // TODO use the following instead of all the while Some(next_idx) = ... blocks
+
+    pub fn iter_with_start(&self, start: usize) -> impl Iterator<Item = &CharNode> {
+        LinkedCharsIter {
+            linked_chars: self,
+            idx: start,
+        }
+    }
+
+    pub fn into_iter_with_start(self, start: usize) -> impl IntoIterator<Item = CharNode> {
+        LinkedCharsOwnedIter {
+            linked_chars: self,
+            idx: start,
+        }
     }
 }
