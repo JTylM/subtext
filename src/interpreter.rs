@@ -38,16 +38,19 @@ fn get_new_job(linked_chars: &LinkedChars, reader_idx: usize) -> Job {
     unimplemented!()
 }
 
+#[derive(PartialEq)]
 enum Brace {
     Curly,
     Round,
 }
 
+// returns the index to the node after the closing brace, or none if the closing brace is the last
+// char in the linked_chars
+// panics if there is no closing brace
 fn find_closing_brace(linked_chars: &LinkedChars, opening_brace_idx: usize, brace: Brace) -> usize {
     let mut number_opened = 1;
-    let next_idx = opening_brace_idx;
-    for node in linked_chars.iter_from(opening_brace_idx) {
-        match linked_chars.get(next_idx).c {
+    for (idx, node) in linked_chars.iter_with_start(opening_brace_idx) {
+        match node.c {
             '{' => {
                 if brace == Brace::Curly {
                     number_opened += 1
@@ -71,7 +74,7 @@ fn find_closing_brace(linked_chars: &LinkedChars, opening_brace_idx: usize, brac
             _ => (),
         }
         if number_opened == 0 {
-            return next_idx;
+            return idx;
         }
     }
     panic!("No closing brace found"); // TODO: add proper error handling
@@ -84,6 +87,6 @@ fn find_closing_brace(linked_chars: &LinkedChars, opening_brace_idx: usize, brac
 //
 struct Interpreter<'a> {
     state: LinkedChars,
-    parent: &'a Interpreter, //
+    parent: &'a Interpreter<'a>, //
     registers: Vec<String>,
 }

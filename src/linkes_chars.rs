@@ -1,7 +1,7 @@
 #[derive(Clone)]
 pub struct CharNode {
     pub c: char,
-    next: Option<usize>, // index into arena of a LinkedChars object
+    pub next: Option<usize>, // index into arena of a LinkedChars object
 }
 
 pub struct LinkedChars {
@@ -14,12 +14,13 @@ pub struct LinkedCharsIter<'a> {
 }
 
 impl<'a> Iterator for LinkedCharsIter<'a> {
-    type Item = &'a CharNode;
+    type Item = (usize, &'a CharNode);
 
     fn next(&mut self) -> Option<Self::Item> {
+        let old_idx = self.idx;
         if let Some(new_idx) = self.linked_chars.get(self.idx).next {
             self.idx = new_idx;
-            Some(self.linked_chars.get(new_idx))
+            Some((old_idx, self.linked_chars.get(new_idx)))
         } else {
             None
         }
@@ -32,9 +33,10 @@ pub struct LinkedCharsOwnedIter {
 }
 
 impl Iterator for LinkedCharsOwnedIter {
-    type Item = CharNode;
+    type Item = (usize, CharNode);
 
     fn next(&mut self) -> Option<Self::Item> {
+        let old_idx = self.idx;
         if let Some(new_idx) = self.linked_chars.arena[self.idx].next {
             self.idx = new_idx;
             let dummy_node = CharNode {
@@ -43,7 +45,7 @@ impl Iterator for LinkedCharsOwnedIter {
             };
             let owned_node = std::mem::replace(&mut self.linked_chars.arena[new_idx], dummy_node);
 
-            Some(owned_node)
+            Some((old_idx, owned_node))
         } else {
             None
         }
@@ -100,7 +102,7 @@ impl LinkedChars {
         }
         // pretend we just added the node at start_index
         let last_node_added_idx = start_idx;
-        for new_node in linked_chars.into_iter_with_start(0) {
+        for (_, new_node) in linked_chars.into_iter_with_start(0) {
             self.arena.push(new_node);
             // the .node just added should be the .next of the last node added
             // the index of the just pushed node is len-1
@@ -109,16 +111,14 @@ impl LinkedChars {
         self.arena.last_mut().unwrap().next = Some(end_idx);
     }
 
-    // TODO use the following instead of all the while Some(next_idx) = ... blocks
-
-    pub fn iter_with_start(&self, start: usize) -> impl Iterator<Item = &CharNode> {
+    pub fn iter_with_start(&self, start: usize) -> impl Iterator<Item = (usize, &CharNode)> {
         LinkedCharsIter {
             linked_chars: self,
             idx: start,
         }
     }
 
-    pub fn into_iter_with_start(self, start: usize) -> impl IntoIterator<Item = CharNode> {
+    pub fn into_iter_with_start(self, start: usize) -> impl IntoIterator<Item = (usize, CharNode)> {
         LinkedCharsOwnedIter {
             linked_chars: self,
             idx: start,
