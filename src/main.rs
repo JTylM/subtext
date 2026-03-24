@@ -1,5 +1,7 @@
-mod linkes_chars;
+pub mod linked_chars;
 
-mod interpreter;
+pub mod interpreter;
+
+pub mod scope;
 
 fn main() {}

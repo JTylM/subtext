@@ -1,6 +1,6 @@
-use crate::linkes_chars::LinkedChars;
+use crate::linked_chars::LinkedChars;
 
-// Helper enum to easily switch between searching for round or curly braces.
+// Helper to easily switch parsing logic between round and curly braces.
 #[derive(PartialEq)]
 enum Brace {
     Round,
@@ -22,7 +22,7 @@ impl Brace {
     }
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(Debug, PartialEq)]
 enum Task {
     Scope {
         content: String,
@@ -48,14 +48,15 @@ enum Task {
     Chill, // Nothing else to do, the interpreter can return
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(Debug, PartialEq)]
 struct Job {
-    start: usize, // The index of the node BEFORE the stuff to be replaced
-    end: usize,   // The end index of the stuff to be replaced
+    start: usize, // The start index (points to the node BEFORE the stuff to be replaced)
+    end: usize,   // The end index (points to the exact last node of the stuff to be replaced)
     task: Task,
 }
 
-// Finds the matching closing brace. Expects start_idx to be the index of the opening brace.
+// Finds the matching closing brace.
+// Expects start_idx to be the exact index of the opening brace.
 fn find_closing_brace(linked_chars: &LinkedChars, start_idx: usize, brace_type: Brace) -> usize {
     let mut number_opened = 1; // The brace at start_idx is already open
     let opening_char = brace_type.opening();
@@ -68,7 +69,7 @@ fn find_closing_brace(linked_chars: &LinkedChars, start_idx: usize, brace_type: 
             number_opened -= 1;
         }
 
-        // When all opened braces are closed, we found our match
+        // When the counter drops back to 0, we found the matching partner
         if number_opened == 0 {
             return i;
         }
@@ -76,20 +77,27 @@ fn find_closing_brace(linked_chars: &LinkedChars, start_idx: usize, brace_type: 
     panic!("Matching closing brace not found");
 }
 
-// Extracts the function name and returns (name, index_of_opening_curly_brace).
-fn find_function_name(linked_chars: &LinkedChars, start_idx: usize) -> (String, usize) {
+// Scans for a function name after a 'def' keyword.
+// Returns: (Extracted Name, Index of the node BEFORE the '{', Index of the '{')
+fn find_function_name(linked_chars: &LinkedChars, start_idx: usize) -> (String, usize, usize) {
     let mut chars_buffer = Vec::new();
+    let mut prev_idx = start_idx;
+
     for (i, node) in linked_chars.enumerate_with_start(start_idx) {
         match node.c {
             '{' => {
+                // The function name ended, we just found the start of the scope
                 if chars_buffer.is_empty() {
-                    panic!("No function name provided, 'def' must be followed by a function name");
+                    panic!("no function name provided, def must be followed by function name");
                 }
-                return (chars_buffer.into_iter().collect(), i);
+                return (chars_buffer.into_iter().collect(), prev_idx, i);
             }
             ' ' => (), // Ignore whitespace to allow for formatting
+
+            // TODO: check for illegal chars in function name here
             c => chars_buffer.push(c),
         }
+        prev_idx = i;
     }
     panic!("Never found the scope with the actual function def");
 }
@@ -97,46 +105,61 @@ fn find_function_name(linked_chars: &LinkedChars, start_idx: usize) -> (String, 
 fn get_new_job(linked_chars: &LinkedChars, reader_idx: usize) -> Job {
     let mut chars_buffer = Vec::new(); // Holds the read chars
 
-    // Index to the node PRECEDING the oldest non-whitespace char.
-    // Crucial for the replace_between function to hook in correctly.
-    let mut oldest_non_whitespace = 0;
+    // Index to the char preceding the oldest non whitespace char we saw.
+    // We use Option<usize> because 0 is a valid index (the Dummy node), so we need
+    // `None` to represent the "unset" state.
+    let mut oldest_non_whitespace: Option<usize> = None;
 
-    // Tracks the index of the node immediately preceding the current iteration step.
+    // Idx to exactly one char back. We return this so that the replacing function works correctly.
+    // Note that the replace function will replace everything AFTER the index we pass, non-inclusive.
     let mut prev_idx = reader_idx;
 
     for (i, node) in linked_chars.enumerate_with_start(reader_idx) {
         match node.c {
             '(' => {
-                // This is a function call. Find the closing brace.
-                let closing_brace_idx = find_closing_brace(linked_chars, i, Brace::Round);
-                let full_string = linked_chars.interval_to_string(i, closing_brace_idx);
+                // Ignore stray parentheses if we haven't read a function name yet
+                if chars_buffer.is_empty() {
+                    chars_buffer.push(node.c);
+                    if oldest_non_whitespace.is_none() {
+                        oldest_non_whitespace = Some(prev_idx);
+                    }
+                } else {
+                    // This is a function call. Find the closing brace.
+                    let closing_brace_idx = find_closing_brace(linked_chars, i, Brace::Round);
 
-                let task = match chars_buffer.iter().collect::<String>().as_str() {
-                    "get_input" => Task::GetInput {
-                        prompt: full_string,
-                    },
-                    "print_output" => Task::PrintOutput {
-                        content: full_string,
-                    },
-                    other_name => Task::FunctionCall {
-                        function_name: other_name.to_string(),
-                        input: full_string,
-                    },
-                };
+                    // Use prev_idx to include the '(' itself in the extracted string
+                    let full_string = linked_chars.interval_to_string(prev_idx, closing_brace_idx);
+                    let name: String = chars_buffer.iter().collect();
 
-                return Job {
-                    start: oldest_non_whitespace,
-                    end: closing_brace_idx,
-                    task,
-                };
+                    let task = match name.as_str() {
+                        "get_input" => Task::GetInput {
+                            prompt: full_string,
+                        },
+                        "print_output" => Task::PrintOutput {
+                            content: full_string,
+                        },
+                        other_name => Task::FunctionCall {
+                            function_name: other_name.to_string(),
+                            input: full_string,
+                        },
+                    };
+
+                    return Job {
+                        start: oldest_non_whitespace.unwrap_or(0),
+                        end: closing_brace_idx,
+                        task,
+                    };
+                }
             }
 
             '{' => {
+                // this is a scope
                 let closing_brace_idx = find_closing_brace(linked_chars, i, Brace::Curly);
-                let full_string = linked_chars.interval_to_string(i, closing_brace_idx);
+                // Use prev_idx to include the '{' itself in the extracted string
+                let full_string = linked_chars.interval_to_string(prev_idx, closing_brace_idx);
 
                 return Job {
-                    start: prev_idx, // Use the node immediately before the '{'
+                    start: prev_idx,
                     end: closing_brace_idx,
                     task: Task::Scope {
                         content: full_string,
@@ -145,14 +168,19 @@ fn get_new_job(linked_chars: &LinkedChars, reader_idx: usize) -> Job {
             }
 
             ' ' => {
-                if chars_buffer.iter().collect::<String>().as_str() == "def" {
-                    let (function_name, opening_brace_idx) = find_function_name(linked_chars, i);
+                let name: String = chars_buffer.iter().collect();
+                if name == "def" {
+                    let (function_name, opening_brace_prev, opening_brace_idx) =
+                        find_function_name(linked_chars, i);
                     let closing_brace_idx =
                         find_closing_brace(linked_chars, opening_brace_idx, Brace::Curly);
-                    let definition_string = linked_chars.interval_to_string(i, closing_brace_idx);
+
+                    // Extract everything including the braces
+                    let definition_string =
+                        linked_chars.interval_to_string(opening_brace_prev, closing_brace_idx);
 
                     return Job {
-                        start: oldest_non_whitespace,
+                        start: oldest_non_whitespace.unwrap_or(0),
                         end: closing_brace_idx,
                         task: Task::DefineFunction {
                             name: function_name,
@@ -160,27 +188,26 @@ fn get_new_job(linked_chars: &LinkedChars, reader_idx: usize) -> Job {
                         },
                     };
                 } else {
+                    // Reset the buffer and start marker if we hit a space and it wasn't 'def'
                     chars_buffer.clear();
-                    // Reset the start marker when clearing the buffer!
-                    oldest_non_whitespace = 0;
+                    oldest_non_whitespace = None;
                 }
             }
 
             c => {
                 chars_buffer.push(c);
-                if oldest_non_whitespace == 0 {
-                    // Mark the node right BEFORE this token sequence started
-                    oldest_non_whitespace = prev_idx;
+                if oldest_non_whitespace.is_none() {
+                    oldest_non_whitespace = Some(prev_idx);
                 }
             }
         }
 
-        // Update prev_idx at the end of every loop iteration to ensure it always lags exactly 1 step behind
+        // Always step the previous index forward at the end of the iteration
         prev_idx = i;
     }
 
     if reader_idx != 0 {
-        // If we reached the end but didn't start at 0, try again from the beginning
+        // We reached the end of the text but started in the middle. Loop around!
         return get_new_job(linked_chars, 0);
     }
 
@@ -191,25 +218,36 @@ fn get_new_job(linked_chars: &LinkedChars, reader_idx: usize) -> Job {
     }
 }
 
+#[derive(Clone)]
+pub struct Function {
+    name: String,
+    body: String,
+}
+
 // An Interpreter gets passed a LinkedChars and is tasked to evaluate it until there are no further changes.
 // It will save regex matches into its own registers.
 // Its children may use the contents of these registers by using the ^ operator on register calls.
-struct Interpreter<'a> {
-    state: LinkedChars,
-    parent: Option<&'a Interpreter<'a>>,
-    registers: Vec<String>,
+pub struct Interpreter<'a> {
+    pub state: LinkedChars,
+
+    // Example: { ab : (.)(.) : { ^$2 ^$1 : ba : it was ab; : it was not ab} }
+    //          ^parent start   ^child start                                ^both end
+    pub parent: Option<&'a Interpreter<'a>>,
+
+    pub registers: Vec<String>,
+    pub functions: Vec<Function>,
 }
 
 impl Interpreter<'_> {
-    fn evaluate(&mut self) {
-        // TODO: find jobs and apply the resp. changes until we get Chill back.
+    pub fn evaluate(&mut self) {
+        // TODO: find jobs and apply the resp. changes until we get Chill back
         // After doing a Job, put the reading head at the start of the returned job.
         // This way, we read the output of the last evaluation back in immediately (for recursion).
     }
 }
 
 // -----------------------------------------------------------------------------
-// Unit Tests for Interpreter Logic
+// Unit Tests
 // -----------------------------------------------------------------------------
 #[cfg(test)]
 mod tests {
@@ -217,145 +255,112 @@ mod tests {
 
     #[test]
     fn test_find_closing_brace_flat() {
-        // Code: "(abc)". Node 1 is '('.
-        let lc = LinkedChars::new_from_iter("(abc)".chars());
-        // start_idx is 1 (the opening brace). It should find the closing brace at node 5.
+        let lc = LinkedChars::from_iter("(abc)".chars());
         let closing_idx = find_closing_brace(&lc, 1, Brace::Round);
-        assert_eq!(
-            closing_idx, 5,
-            "Should find the closing brace exactly at node 5"
-        );
+        assert_eq!(closing_idx, 5);
     }
 
     #[test]
     fn test_find_closing_brace_nested() {
-        // Code: "(a(b)c)". Node 1 is '(', node 7 is ')'.
-        let lc = LinkedChars::new_from_iter("(a(b)c)".chars());
+        let lc = LinkedChars::from_iter("(a(b)c)".chars());
         let closing_idx = find_closing_brace(&lc, 1, Brace::Round);
-        assert_eq!(
-            closing_idx, 7,
-            "Should correctly ignore nested braces and find the outer one"
-        );
+        assert_eq!(closing_idx, 7);
     }
 
     #[test]
     #[should_panic(expected = "Matching closing brace not found")]
     fn test_find_closing_brace_missing() {
-        let lc = LinkedChars::new_from_iter("(abc".chars());
-        find_closing_brace(&lc, 1, Brace::Round); // Should panic because there is no ')'
+        let lc = LinkedChars::from_iter("(abc".chars());
+        find_closing_brace(&lc, 1, Brace::Round);
     }
 
     #[test]
     fn test_find_function_name() {
-        // We parsed "def", now we scan the rest: "  my_func  {...}"
-        // Dummy(0), ' '(1), ' '(2), 'm'(3)...
-        let lc = LinkedChars::new_from_iter("  my_func  {".chars());
-        // start scanning from dummy. Expected: name="my_func", index of '{' = 12
-        let (name, brace_idx) = find_function_name(&lc, 0);
+        let lc = LinkedChars::from_iter("  my_func  {".chars());
+        let (name, prev_idx, brace_idx) = find_function_name(&lc, 0);
+        assert_eq!(name, "my_func");
         assert_eq!(
-            name, "my_func",
-            "Should skip spaces and extract the function name"
+            prev_idx, 11,
+            "Must find the node exactly before the curly brace"
         );
-        assert_eq!(
-            brace_idx, 12,
-            "Should return the exact index of the curly brace"
-        );
+        assert_eq!(brace_idx, 12);
     }
 
     #[test]
     fn test_get_new_job_function_call() {
-        // Code: "foo(bar)". Node 0=Dummy, 1='f', 2='o', 3='o', 4='(', 5='b', 6='a', 7='r', 8=')'
-        let lc = LinkedChars::new_from_iter("foo(bar)".chars());
+        let lc = LinkedChars::from_iter("  foo(bar)".chars());
         let job = get_new_job(&lc, 0);
 
         let expected_job = Job {
-            start: 0, // Points to Dummy, right BEFORE 'foo'
-            end: 8,   // Points exactly at ')'
+            start: 2,
+            end: 10,
             task: Task::FunctionCall {
                 function_name: "foo".to_string(),
-                input: "(bar)".to_string(), // Input includes the braces based on interval_to_string logic
+                input: "(bar)".to_string(),
             },
         };
-        assert_eq!(
-            job, expected_job,
-            "Should correctly parse a standard function call"
-        );
+        assert_eq!(job, expected_job);
     }
 
     #[test]
     fn test_get_new_job_built_in_functions() {
-        // Code: "print_output(123)". Length: 17 chars. Node 17 is ')'.
-        let lc = LinkedChars::new_from_iter("print_output(123)".chars());
+        let lc = LinkedChars::from_iter("print_output(123)".chars());
         let job = get_new_job(&lc, 0);
 
-        assert_eq!(job.start, 0, "Start is dummy node");
-        assert_eq!(job.end, 17, "End is the closing brace");
+        assert_eq!(job.start, 0);
+        assert_eq!(job.end, 17);
         assert_eq!(
             job.task,
             Task::PrintOutput {
                 content: "(123)".to_string()
-            },
-            "Should recognize the reserved keyword 'print_output'"
+            }
         );
     }
 
     #[test]
     fn test_get_new_job_scope() {
-        // Code: "  { a }". Node 0=Dummy, 1=' ', 2=' ', 3='{', ...
-        let lc = LinkedChars::new_from_iter("  { a }".chars());
+        let lc = LinkedChars::from_iter("  { a }".chars());
         let job = get_new_job(&lc, 0);
 
-        assert_eq!(
-            job.start, 2,
-            "Start must be the node immediately PRECEDING the opening brace '{'"
-        );
+        assert_eq!(job.start, 2);
         assert_eq!(
             job.task,
             Task::Scope {
                 content: "{ a }".to_string()
-            },
-            "Should correctly identify a standalone scope"
+            }
         );
     }
 
     #[test]
     fn test_get_new_job_def_function() {
-        // Code: "def my_func { body }".
-        let lc = LinkedChars::new_from_iter("def my_func { body }".chars());
+        let lc = LinkedChars::from_iter("def my_func { body }".chars());
         let job = get_new_job(&lc, 0);
 
-        assert_eq!(job.start, 0, "Start points to Dummy node BEFORE 'def'");
-        // Ensure that the task is interpreted as DefineFunction.
+        assert_eq!(job.start, 0);
         if let Task::DefineFunction { name, definition } = job.task {
             assert_eq!(name, "my_func");
             assert_eq!(definition, "{ body }");
         } else {
-            panic!("Expected DefineFunction task, got something else");
+            panic!("Expected DefineFunction task");
         }
     }
 
     #[test]
     fn test_get_new_job_chill() {
-        // Code with no action items.
-        let lc = LinkedChars::new_from_iter("just_some_text".chars());
+        let lc = LinkedChars::from_iter("just_some_text".chars());
         let job = get_new_job(&lc, 0);
 
-        assert_eq!(job.task, Task::Chill, "If no job is found, return Chill");
+        assert_eq!(job.task, Task::Chill);
     }
 
     #[test]
     fn test_get_new_job_loop_around() {
-        // Code: "  foo()", but we start reading from index 5 ('o').
-        // The reader hits the end, realizes it didn't start at 0, loops back, and finds "foo()".
-        let lc = LinkedChars::new_from_iter("  foo()".chars());
+        let lc = LinkedChars::from_iter("  foo()".chars());
         let job = get_new_job(&lc, 5);
 
-        assert_eq!(job.start, 2, "Start is right before 'f'");
+        assert_eq!(job.start, 2);
         if let Task::FunctionCall { function_name, .. } = job.task {
-            assert_eq!(
-                function_name, "foo",
-                "Loop around should successfully find the job"
-            );
+            assert_eq!(function_name, "foo");
         } else {
             panic!("Expected FunctionCall");
         }
