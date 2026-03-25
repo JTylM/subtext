@@ -2,6 +2,23 @@ use crate::linked_chars::LinkedChars;
 
 use crate::scope::evaluate_scope;
 
+// An Interpreter gets passed a LinkedChars and is tasked to evaluate it until there are no further changes.
+// It will save regex matches into its own registers.
+// Its children may use the contents of these registers by using the ^ operator on register calls.
+pub struct Interpreter<'a> {
+    pub state: LinkedChars,
+
+    // Example: { ab : (.)(.) : { ^$2 ^$1 : ba : it was ab; : it was not ab} }
+    //          ^parent start   ^child start                                ^both end
+    pub parent: Option<&'a Interpreter<'a>>,
+    // registers holds the capture groups from the parent! This is because we want to use an
+    // interpreter to evaluate the input and output strings of a scope. As these are then their own
+    // interpreters, they should have their regirst point to the scope that we actually want to
+    // evaluate.
+    pub registers: Vec<String>,
+    pub functions: Vec<Function>,
+}
+
 // Helper to easily switch parsing logic between round and curly braces.
 #[derive(PartialEq)]
 enum Brace {
@@ -79,6 +96,34 @@ fn find_closing_brace(linked_chars: &LinkedChars, start_idx: usize, brace_type: 
     panic!("Matching closing brace not found");
 }
 
+// returns the register number and the index to the space terminating the number
+// (register number, idx to space)
+fn find_register_number(linked_chars: &LinkedChars, start_idx: usize) -> (usize, usize) {
+    let mut register_number = 0;
+    let mut found_at_least_one_digit = false;
+    for (i, node) in linked_chars.enumerate_with_start(start_idx) {
+        match node.c {
+            ' ' => {
+                if !found_at_least_one_digit {
+                    panic!("no digit found after register call")
+                };
+                return (register_number, i);
+            }
+
+            '0'..='9' => {
+                let new_digit = node.c.to_digit(10).unwrap() as usize;
+                register_number = 10 * register_number + new_digit;
+                found_at_least_one_digit = true;
+            }
+
+            _ => {
+                panic!("illegal char found while parsing register number");
+            }
+        }
+    }
+    panic!("no terminating whitespace found");
+}
+
 // Scans for a function name after a 'def' keyword.
 // Returns: (Extracted Name, Index of the node BEFORE the '{', Index of the '{')
 fn find_function_name(linked_chars: &LinkedChars, start_idx: usize) -> (String, usize, usize) {
@@ -118,9 +163,13 @@ fn get_new_job(linked_chars: &LinkedChars, reader_idx: usize) -> Job {
     // `None` to represent the "unset" state.
     let mut oldest_non_whitespace: Option<usize> = None;
 
+    let mut oldest_uptick: Option<usize> = None;
+
     // Idx to exactly one char back. We return this so that the replacing function works correctly.
     // Note that the replace function will replace everything AFTER the index we pass, non-inclusive.
     let mut prev_idx = reader_idx;
+
+    let mut number_consecutive_uptick = 0;
 
     for (i, node) in linked_chars.enumerate_with_start(reader_idx) {
         match node.c {
@@ -131,6 +180,7 @@ fn get_new_job(linked_chars: &LinkedChars, reader_idx: usize) -> Job {
                     if oldest_non_whitespace.is_none() {
                         oldest_non_whitespace = Some(prev_idx);
                     }
+                    number_consecutive_uptick = 0;
                 } else {
                     // This is a function call. Find the closing brace.
                     let closing_brace_idx = find_closing_brace(linked_chars, i, Brace::Round);
@@ -164,6 +214,8 @@ fn get_new_job(linked_chars: &LinkedChars, reader_idx: usize) -> Job {
                 // this is a scope
                 let closing_brace_idx = find_closing_brace(linked_chars, i, Brace::Curly);
                 // Use prev_idx to include the '{' itself in the extracted string
+                // TODO: In the scope evaluation, the braces are striped away anyway
+                // we could just not pup them in in the first place
                 let full_string = linked_chars.interval_to_string(prev_idx, closing_brace_idx);
 
                 return Job {
@@ -199,11 +251,37 @@ fn get_new_job(linked_chars: &LinkedChars, reader_idx: usize) -> Job {
                     // Reset the buffer and start marker if we hit a space and it wasn't 'def'
                     chars_buffer.clear();
                     oldest_non_whitespace = None;
+                    number_consecutive_uptick = 0;
+                    oldest_uptick = None;
                 }
+            }
+
+            '^' => {
+                number_consecutive_uptick += 1;
+                if oldest_uptick.is_none() {
+                    oldest_uptick = Some(prev_idx);
+                }
+            }
+
+            '#' => {
+                // the new char for register calls, as not to conflict with regex syntax
+                // find the register which should be called
+                let (register_number, idx_to_terminating_space) =
+                    find_register_number(linked_chars, i);
+
+                return Job {
+                    start: oldest_uptick.unwrap_or(0),
+                    end: idx_to_terminating_space,
+                    task: Task::RegisterCall {
+                        level: number_consecutive_uptick,
+                        index: register_number,
+                    },
+                };
             }
 
             c => {
                 chars_buffer.push(c);
+                number_consecutive_uptick = 0;
                 if oldest_non_whitespace.is_none() {
                     oldest_non_whitespace = Some(prev_idx);
                 }
@@ -232,20 +310,6 @@ pub struct Function {
     body: String,
 }
 
-// An Interpreter gets passed a LinkedChars and is tasked to evaluate it until there are no further changes.
-// It will save regex matches into its own registers.
-// Its children may use the contents of these registers by using the ^ operator on register calls.
-pub struct Interpreter<'a> {
-    pub state: LinkedChars,
-
-    // Example: { ab : (.)(.) : { ^$2 ^$1 : ba : it was ab; : it was not ab} }
-    //          ^parent start   ^child start                                ^both end
-    pub parent: Option<&'a Interpreter<'a>>,
-
-    pub registers: Vec<String>,
-    pub functions: Vec<Function>,
-}
-
 impl Interpreter<'_> {
     pub fn evaluate(&mut self) {
         // TODO: find jobs and apply the resp. changes until we get Chill back
@@ -267,9 +331,29 @@ impl Interpreter<'_> {
                         .replace_between(job.start, job.end, result_of_evaluation);
                 }
 
+                Task::RegisterCall { level, index } => {
+                    let result =
+                        LinkedChars::from_iter(self.get_register_at_level(level, index).chars());
+                    self.state.replace_between(job.start, job.end, result);
+                }
+
                 _ => unimplemented!(),
             }
         }
+    }
+
+    fn get_register_at_level(&self, level: usize, index: usize) -> String {
+        let mut current: &Interpreter = self;
+        for _ in 0..level {
+            if let Some(parent_ref) = current.parent {
+                current = parent_ref;
+            } else {
+                panic!("no parent scope found, register call is too high.");
+            }
+        }
+
+        // We successfully went up `level` times. Return the register found here.
+        current.registers[index].clone()
     }
 }
 
