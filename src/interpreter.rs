@@ -1,3 +1,4 @@
+use crate::error::{BacktraceFrame, ErrorKind, SubtextError};
 use crate::linked_chars::LinkedChars;
 
 use crate::scope::evaluate_scope;
@@ -54,7 +55,8 @@ enum Task {
     },
     RegisterCall {
         level: usize,
-        index: usize,
+        requested_index: usize,
+        position: usize,
     },
     GetInput {
         prompt: String,
@@ -74,7 +76,11 @@ struct Job {
 
 // Finds the matching closing brace.
 // Expects start_idx to be the exact index of the opening brace.
-fn find_closing_brace(linked_chars: &LinkedChars, start_idx: usize, brace_type: Brace) -> usize {
+fn find_closing_brace(
+    linked_chars: &LinkedChars,
+    start_idx: usize,
+    brace_type: Brace,
+) -> Result<usize, SubtextError> {
     let mut number_opened = 1; // The brace at start_idx is already open
     let opening_char = brace_type.opening();
     let closing_char = brace_type.closing();
@@ -88,16 +94,27 @@ fn find_closing_brace(linked_chars: &LinkedChars, start_idx: usize, brace_type: 
 
         // When the counter drops back to 0, we found the matching partner
         if number_opened == 0 {
-            return i;
+            return Ok(i);
         }
     }
-    panic!("Matching closing brace not found");
+    Err(SubtextError::new(ErrorKind::UnmatchedOpeningBrace {
+        expected_closing: closing_char,
+        opened_at: start_idx,
+    }))
 }
 
 // returns the register number and the index to the last digit
 // any non digit char can terminate the register call
 // (register number, idx_to_last_digit)
-fn find_register_number(linked_chars: &LinkedChars, start_idx: usize) -> (usize, usize) {
+// if the register call is terminated by a space, then we actually return the index to that space
+// to drop it as well
+// (by returning its index)
+// This way, we can do something like #1 1 to obtain <value of #1>1. Otherwise,
+// this would be impossible to get, because #11 doesnt work
+fn find_register_number(
+    linked_chars: &LinkedChars,
+    start_idx: usize,
+) -> Result<(usize, usize), SubtextError> {
     let mut register_number = 0;
     let mut last_found_digit_idx = 0;
     for (i, node) in linked_chars.enumerate_with_start(start_idx) {
@@ -108,20 +125,34 @@ fn find_register_number(linked_chars: &LinkedChars, start_idx: usize) -> (usize,
                 last_found_digit_idx = i;
             }
 
-            _ => {
+            c => {
+                // if the register call is terminated by a space, then we drop that space as well
+                if c == ' ' {
+                    last_found_digit_idx = i;
+                }
                 break;
             }
         }
     }
     if last_found_digit_idx == 0 {
-        panic!("no digit found after register call")
+        return Err(SubtextError::new(ErrorKind::MissingRegisterDigit {
+            position: start_idx,
+        }));
     };
-    (register_number, last_found_digit_idx)
+    if register_number == 0 {
+        return Err(SubtextError::new(ErrorKind::RegisterIndexStartsAtOne {
+            position: start_idx,
+        }));
+    }
+    Ok((register_number, last_found_digit_idx))
 }
 
 // Scans for a function name after a 'def' keyword.
 // Returns: (Extracted Name, Index of the node BEFORE the '{', Index of the '{')
-fn find_function_name(linked_chars: &LinkedChars, start_idx: usize) -> (String, usize, usize) {
+fn find_function_name(
+    linked_chars: &LinkedChars,
+    start_idx: usize,
+) -> Result<(String, usize, usize), SubtextError> {
     let mut chars_buffer = Vec::new();
     let mut prev_idx = start_idx;
 
@@ -130,18 +161,22 @@ fn find_function_name(linked_chars: &LinkedChars, start_idx: usize) -> (String, 
             '{' => {
                 // The function name ended, we just found the start of the scope
                 if chars_buffer.is_empty() {
-                    panic!("no function name provided, def must be followed by function name");
+                    return Err(SubtextError::new(ErrorKind::MissingFunctionName {
+                        position: start_idx,
+                    }));
                 }
-                return (chars_buffer.into_iter().collect(), prev_idx, i);
+                return Ok((chars_buffer.into_iter().collect(), prev_idx, i));
             }
-            ' ' => (), // Ignore whitespace to allow for formatting
+            c if c.is_whitespace() => (), // Ignore whitespace to allow for formatting
 
             // TODO: check for illegal chars in function name here
             c => chars_buffer.push(c),
         }
         prev_idx = i;
     }
-    panic!("Never found the scope with the actual function def");
+    Err(SubtextError::new(ErrorKind::MissingFunctionBody {
+        position: start_idx,
+    }))
 }
 
 // returns the next job to do
@@ -150,7 +185,9 @@ fn find_function_name(linked_chars: &LinkedChars, start_idx: usize) -> (String, 
 // Example: here is a scope:  _{ foo : bar : no match }
 //                            ^start                  ^end
 // start points to the _, end point to the }
-fn get_new_job(linked_chars: &LinkedChars, reader_idx: usize) -> Job {
+// TODO: move the pointers inwards by one for scopes and functions. At the moment we manually
+// remove the braces anyway later
+fn get_new_job(linked_chars: &LinkedChars, reader_idx: usize) -> Result<Job, SubtextError> {
     let mut chars_buffer = Vec::new(); // Holds the read chars
 
     // Index to the char preceding the oldest non whitespace char we saw.
@@ -179,10 +216,11 @@ fn get_new_job(linked_chars: &LinkedChars, reader_idx: usize) -> Job {
                     continue;
                 }
                 // This is a function call. Find the closing brace.
-                let closing_brace_idx = find_closing_brace(linked_chars, i, Brace::Round);
+                let closing_brace_idx = find_closing_brace(linked_chars, i, Brace::Round)?;
 
                 // Use prev_idx to include the '(' itself in the extracted string
-                let full_string = linked_chars.interval_to_string(prev_idx, closing_brace_idx);
+                // TODO: edit here when moving the pointers inwards to exclude the braces
+                let full_string = linked_chars.interval_to_string(prev_idx, closing_brace_idx)?;
                 let name: String = chars_buffer.iter().collect();
 
                 let task = match name.as_str() {
@@ -198,52 +236,52 @@ fn get_new_job(linked_chars: &LinkedChars, reader_idx: usize) -> Job {
                     },
                 };
 
-                return Job {
+                return Ok(Job {
                     start: oldest_non_whitespace.unwrap_or(0),
                     end: closing_brace_idx,
                     task,
-                };
+                });
             }
 
             '{' => {
                 // this is a scope
-                let closing_brace_idx = find_closing_brace(linked_chars, i, Brace::Curly);
+                let closing_brace_idx = find_closing_brace(linked_chars, i, Brace::Curly)?;
                 // Use prev_idx to include the '{' itself in the extracted string
                 // TODO: In the scope evaluation, the braces are striped away anyway
                 // we could just not put them in at all
-                let full_string = linked_chars.interval_to_string(prev_idx, closing_brace_idx);
+                let full_string = linked_chars.interval_to_string(prev_idx, closing_brace_idx)?;
 
-                return Job {
+                return Ok(Job {
                     start: prev_idx,
                     end: closing_brace_idx,
                     task: Task::Scope {
                         content: full_string,
                     },
-                };
+                });
             }
 
-            ' ' => {
+            c if c.is_whitespace() => {
                 let name: String = chars_buffer.iter().collect();
                 if name == "def" {
                     let (function_name, opening_brace_prev, opening_brace_idx) =
-                        find_function_name(linked_chars, i);
+                        find_function_name(linked_chars, i)?;
                     let closing_brace_idx =
-                        find_closing_brace(linked_chars, opening_brace_idx, Brace::Curly);
+                        find_closing_brace(linked_chars, opening_brace_idx, Brace::Curly)?;
 
                     // Extract everything including the braces
                     let definition_string =
-                        linked_chars.interval_to_string(opening_brace_prev, closing_brace_idx);
+                        linked_chars.interval_to_string(opening_brace_prev, closing_brace_idx)?;
 
-                    return Job {
+                    return Ok(Job {
                         start: oldest_non_whitespace.unwrap_or(0),
                         end: closing_brace_idx,
                         task: Task::DefineFunction {
                             name: function_name,
                             definition: definition_string,
                         },
-                    };
+                    });
                 } else {
-                    // Reset the buffer and start marker if we hit a space and it wasn't 'def'
+                    // Reset the buffer and start marker if we hit whitespace and it wasn't 'def'
                     chars_buffer.clear();
                     oldest_non_whitespace = None;
                     number_consecutive_uptick = 0;
@@ -262,17 +300,17 @@ fn get_new_job(linked_chars: &LinkedChars, reader_idx: usize) -> Job {
                 // the new char for register calls, as not to conflict with regex syntax
                 // find the register which should be called
                 let (register_number, idx_to_terminating_char) =
-                    find_register_number(linked_chars, i);
-                // println!("{}, {}", register_number, idx_to_terminating_char);
+                    find_register_number(linked_chars, i)?;
 
-                return Job {
+                return Ok(Job {
                     start: oldest_uptick.unwrap_or(prev_idx),
                     end: idx_to_terminating_char,
                     task: Task::RegisterCall {
                         level: number_consecutive_uptick,
-                        index: register_number,
+                        requested_index: register_number,
+                        position: i,
                     },
-                };
+                });
             }
 
             c => {
@@ -293,11 +331,11 @@ fn get_new_job(linked_chars: &LinkedChars, reader_idx: usize) -> Job {
         return get_new_job(linked_chars, 0);
     }
 
-    Job {
+    Ok(Job {
         task: Task::Chill,
         start: 0,
         end: 0,
-    }
+    })
 }
 
 #[derive(Clone)]
@@ -307,27 +345,39 @@ pub struct Function {
 }
 
 impl Interpreter<'_> {
-    pub fn evaluate(&mut self) {
+    pub fn evaluate(&mut self) -> Result<(), SubtextError> {
         // find jobs and apply the resp. changes until we get Chill back
         // After doing a Job, put the reading head at the start of the returned job.
         // This way, we read the output of the last evaluation back in immediately (for recursion).
         let mut reading_head = 0;
-        'outer: loop {
-            let job = get_new_job(&self.state, reading_head);
+        loop {
+            let job = match get_new_job(&self.state, reading_head) {
+                Ok(job) => job,
+                Err(err) => {
+                    return Err(self.attach_backtrace_if_empty(err, None));
+                }
+            };
             reading_head = job.start; // always read the replacement back in 
             match job.task {
                 Task::Chill => break, // we are done
 
                 Task::Scope { content: scope } => {
                     // evaluate the scope
-                    let result = evaluate_scope(scope, self);
+                    let result = evaluate_scope(scope, self)
+                        .map_err(|err| self.attach_backtrace_if_empty(err, None))?;
                     // modify the state
                     self.state.replace_between(job.start, job.end, result);
                 }
 
-                Task::RegisterCall { level, index } => {
-                    let result =
-                        LinkedChars::from_iter(self.get_register_at_level(level, index).chars());
+                Task::RegisterCall {
+                    level,
+                    requested_index,
+                    position,
+                } => {
+                    let register_value = self
+                        .get_register_at_level(level, requested_index)
+                        .map_err(|err| self.attach_backtrace_if_empty(err, Some(position)))?;
+                    let result = LinkedChars::from_iter(register_value.chars());
                     self.state.replace_between(job.start, job.end, result);
                 }
 
@@ -348,6 +398,7 @@ impl Interpreter<'_> {
                     let found_function = self
                         .functions
                         .iter()
+                        .rev()  // iter in reverse as promised
                         .find(|func| func.name == function_name);
 
                     match found_function {
@@ -367,26 +418,41 @@ impl Interpreter<'_> {
 
                             let scope = format!("{{ {} :: {} }}", clean_input, clean_body);
 
-                            let result = evaluate_scope(scope, self);
+                            let result = evaluate_scope(scope, self)
+                                .map_err(|err| self.attach_backtrace_if_empty(err, None))?;
                             self.state.replace_between(job.start, job.end, result);
                         }
                         None => {
-                            panic!(
-                                "Called an undefined function, tried to call {}",
-                                function_name
-                            );
+                            return Err(self.attach_backtrace_if_empty(
+                                SubtextError::new(ErrorKind::UndefinedFunction {
+                                    name: function_name,
+                                }),
+                                None,
+                            ));
                         }
                     }
                 }
 
                 Task::GetInput { prompt } => {
                     print!("{}", prompt);
-                    io::stdout().flush().unwrap();
+                    io::stdout().flush().map_err(|err| {
+                        self.attach_backtrace_if_empty(
+                            SubtextError::new(ErrorKind::OutputWriteError {
+                                reason: err.to_string(),
+                            }),
+                            None,
+                        )
+                    })?;
                     let mut response = String::new();
 
-                    io::stdin()
-                        .read_line(&mut response)
-                        .expect("Failed to read line");
+                    io::stdin().read_line(&mut response).map_err(|err| {
+                        self.attach_backtrace_if_empty(
+                            SubtextError::new(ErrorKind::InputReadError {
+                                reason: err.to_string(),
+                            }),
+                            None,
+                        )
+                    })?;
 
                     let clean_response = response.trim().to_string();
                     let ls = LinkedChars::from_iter(clean_response.chars());
@@ -394,24 +460,154 @@ impl Interpreter<'_> {
                 }
 
                 Task::PrintOutput { content } => {
-                    println!("{}", content);
+                    let mut inner_content = if content.starts_with('(') && content.ends_with(')') {
+                        content[1..content.len() - 1].to_string()
+                    } else {
+                        content
+                    };
+
+                    if !inner_content.starts_with('\'') {
+                        // in this case we evaluate first
+                        let lc = LinkedChars::from_iter(inner_content.chars());
+                        let mut interpreter = Interpreter {
+                            state: lc,
+                            registers: self.registers.clone(),
+                            parent: self.parent,
+                            functions: self.functions.clone(),
+                        };
+                        interpreter.evaluate()?;
+                        inner_content = interpreter.state.make_string();
+                    }
+
+                    println!("{}", inner_content);
                     self.state.remove_between(job.start, job.end);
                 }
             }
         }
+        Ok(())
     }
 
-    fn get_register_at_level(&self, level: usize, index: usize) -> String {
+    fn get_register_at_level(
+        &self,
+        level: usize,
+        requested_index: usize,
+    ) -> Result<String, SubtextError> {
         let mut current: &Interpreter = self;
+        let mut depth_reached = 0;
         for _ in 0..level {
             if let Some(parent_ref) = current.parent {
                 current = parent_ref;
+                depth_reached += 1;
             } else {
-                panic!("no parent scope found, register call is too high.");
+                return Err(SubtextError::new(ErrorKind::MissingParentScope {
+                    requested_level: level,
+                    actual_depth: depth_reached,
+                }));
             }
         }
+        if requested_index == 0 {
+            return Err(SubtextError::new(ErrorKind::InternalInvariant {
+                message: "register index must be >= 1".to_string(),
+            }));
+        }
+        let zero_based = requested_index - 1;
         // We successfully went up `level` times. Return the register found here.
-        current.registers[index].clone()
+        if let Some(value) = current.registers.get(zero_based) {
+            return Ok(value.clone());
+        }
+
+        let suggestion = self.find_register_suggestion(level, requested_index);
+        Err(SubtextError::new(ErrorKind::RegisterOutOfBounds {
+            requested: requested_index,
+            available: current.registers.len(),
+            suggestion,
+        }))
+    }
+
+    fn find_register_suggestion(&self, level: usize, requested_index: usize) -> Option<String> {
+        let mut current = self;
+        for _ in 0..level {
+            current = current.parent?;
+        }
+
+        if requested_index == 0 {
+            return None;
+        }
+        let zero_based = requested_index - 1;
+
+        let mut extra = 1;
+        let mut ancestor = current.parent;
+        while let Some(parent_ref) = ancestor {
+            if zero_based < parent_ref.registers.len() {
+                let prefix = "^".repeat(level + extra);
+                return Some(format!("{}#{}", prefix, requested_index));
+            }
+            ancestor = parent_ref.parent;
+            extra += 1;
+        }
+        None
+    }
+
+    fn build_backtrace(&self, highlight: Option<usize>) -> Vec<BacktraceFrame> {
+        let mut frames = Vec::new();
+        let mut current: Option<&Interpreter> = Some(self);
+        let mut depth = 0;
+
+        while let Some(interpreter) = current {
+            let snippet = if depth == 0 {
+                interpreter.state.make_snippet(highlight, 80)
+            } else {
+                interpreter.state.make_snippet(None, 80)
+            };
+
+            frames.push(BacktraceFrame {
+                depth,
+                full_state: interpreter.state.clone(),
+                state_snippet: snippet,
+                registers: interpreter.registers.clone(),
+                defined_functions: interpreter
+                    .functions
+                    .iter()
+                    .map(|func| func.name.clone())
+                    .collect(),
+            });
+
+            current = interpreter.parent;
+            depth += 1;
+        }
+
+        frames
+    }
+
+    pub(crate) fn attach_backtrace_if_empty(
+        &self,
+        mut err: SubtextError,
+        highlight: Option<usize>,
+    ) -> SubtextError {
+        if err.backtrace.is_empty() {
+            let derived_highlight = highlight.or_else(|| self.highlight_from_error_kind(&err.kind));
+            err.backtrace = self.build_backtrace(derived_highlight);
+        }
+        err
+    }
+
+    pub(crate) fn attach_backtrace_without_highlight(&self, mut err: SubtextError) -> SubtextError {
+        if err.backtrace.is_empty() {
+            err.backtrace = self.build_backtrace(None);
+        }
+        err
+    }
+
+    fn highlight_from_error_kind(&self, kind: &ErrorKind) -> Option<usize> {
+        match kind {
+            ErrorKind::UnmatchedOpeningBrace { opened_at, .. } => Some(*opened_at),
+            ErrorKind::UnmatchedClosingBrace { position, .. } => Some(*position),
+            ErrorKind::MissingRegisterDigit { position } => Some(*position),
+            ErrorKind::MissingFunctionName { position } => Some(*position),
+            ErrorKind::MissingFunctionBody { position } => Some(*position),
+            ErrorKind::RegisterIndexStartsAtOne { position } => Some(*position),
+            _ => None,
+        }
     }
 }
 
@@ -421,32 +617,39 @@ impl Interpreter<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ErrorKind;
 
     #[test]
     fn test_find_closing_brace_flat() {
         let lc = LinkedChars::from_iter("(abc)".chars());
-        let closing_idx = find_closing_brace(&lc, 1, Brace::Round);
+        let closing_idx = find_closing_brace(&lc, 1, Brace::Round).unwrap();
         assert_eq!(closing_idx, 5);
     }
 
     #[test]
     fn test_find_closing_brace_nested() {
         let lc = LinkedChars::from_iter("(a(b)c)".chars());
-        let closing_idx = find_closing_brace(&lc, 1, Brace::Round);
+        let closing_idx = find_closing_brace(&lc, 1, Brace::Round).unwrap();
         assert_eq!(closing_idx, 7);
     }
 
     #[test]
-    #[should_panic(expected = "Matching closing brace not found")]
     fn test_find_closing_brace_missing() {
         let lc = LinkedChars::from_iter("(abc".chars());
-        find_closing_brace(&lc, 1, Brace::Round);
+        let result = find_closing_brace(&lc, 1, Brace::Round);
+        assert!(result.is_err(), "Expected missing closing brace to error");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err.kind, ErrorKind::UnmatchedOpeningBrace { .. }),
+            "Expected UnmatchedOpeningBrace, got {:?}",
+            err.kind
+        );
     }
 
     #[test]
     fn test_find_function_name() {
         let lc = LinkedChars::from_iter("  my_func  {".chars());
-        let (name, prev_idx, brace_idx) = find_function_name(&lc, 0);
+        let (name, prev_idx, brace_idx) = find_function_name(&lc, 0).unwrap();
         assert_eq!(name, "my_func");
         assert_eq!(
             prev_idx, 11,
@@ -458,7 +661,7 @@ mod tests {
     #[test]
     fn test_get_new_job_function_call() {
         let lc = LinkedChars::from_iter("  foo(bar)".chars());
-        let job = get_new_job(&lc, 0);
+        let job = get_new_job(&lc, 0).unwrap();
 
         let expected_job = Job {
             start: 2,
@@ -474,7 +677,7 @@ mod tests {
     #[test]
     fn test_get_new_job_built_in_functions() {
         let lc = LinkedChars::from_iter("print_output(123)".chars());
-        let job = get_new_job(&lc, 0);
+        let job = get_new_job(&lc, 0).unwrap();
 
         assert_eq!(job.start, 0);
         assert_eq!(job.end, 17);
@@ -489,7 +692,7 @@ mod tests {
     #[test]
     fn test_get_new_job_scope() {
         let lc = LinkedChars::from_iter("  { a }".chars());
-        let job = get_new_job(&lc, 0);
+        let job = get_new_job(&lc, 0).unwrap();
 
         assert_eq!(job.start, 2);
         assert_eq!(
@@ -503,7 +706,7 @@ mod tests {
     #[test]
     fn test_get_new_job_def_function() {
         let lc = LinkedChars::from_iter("def my_func { body }".chars());
-        let job = get_new_job(&lc, 0);
+        let job = get_new_job(&lc, 0).unwrap();
 
         assert_eq!(job.start, 0);
         if let Task::DefineFunction { name, definition } = job.task {
@@ -517,7 +720,7 @@ mod tests {
     #[test]
     fn test_get_new_job_chill() {
         let lc = LinkedChars::from_iter("just_some_text".chars());
-        let job = get_new_job(&lc, 0);
+        let job = get_new_job(&lc, 0).unwrap();
 
         assert_eq!(job.task, Task::Chill);
     }
@@ -525,7 +728,7 @@ mod tests {
     #[test]
     fn test_get_new_job_loop_around() {
         let lc = LinkedChars::from_iter("  foo()".chars());
-        let job = get_new_job(&lc, 5);
+        let job = get_new_job(&lc, 5).unwrap();
 
         assert_eq!(job.start, 2);
         if let Task::FunctionCall { function_name, .. } = job.task {
@@ -548,7 +751,7 @@ mod tests {
             functions: vec![],
             parent: None,
         };
-        interpreter.evaluate();
+        interpreter.evaluate().expect("Evaluation failed");
         assert_eq!(
             interpreter.state.make_string(),
             "hello, world! goodby, moon!".to_string()
@@ -566,7 +769,7 @@ mod tests {
             functions: vec![],
             parent: None,
         };
-        interpreter.evaluate();
+        interpreter.evaluate().expect("Evaluation failed");
         assert_eq!(interpreter.state.make_string(), "hello, world!".to_string());
     }
 
@@ -586,7 +789,193 @@ mod tests {
             functions: vec![],
             parent: None,
         };
-        interpreter.evaluate();
+        interpreter.evaluate().expect("Evaluation failed");
         assert_eq!(interpreter.state.make_string(), "= > <".to_string());
+    }
+
+    #[test]
+    fn define_function_with_newlines() {
+        let lc = LinkedChars::from_iter("def\nadd_positive { a => ok } add_positive(a)".chars());
+        let mut interpreter = Interpreter {
+            state: lc,
+            registers: vec![],
+            functions: vec![],
+            parent: None,
+        };
+
+        interpreter.evaluate().expect("Evaluation failed");
+        assert_eq!(interpreter.state.make_string().trim(), "ok");
+    }
+
+    #[test]
+    fn define_function_body_without_input_separator() {
+        let lc = LinkedChars::from_iter("def f { (a) => ok } f(a)".chars());
+        let mut interpreter = Interpreter {
+            state: lc,
+            registers: vec![],
+            functions: vec![],
+            parent: None,
+        };
+
+        interpreter.evaluate().expect("Evaluation failed");
+        assert_eq!(interpreter.state.make_string().trim(), "ok");
+    }
+
+    #[test]
+    fn test_missing_register_digit_error() {
+        let lc = LinkedChars::from_iter("#".chars());
+        let mut interpreter = Interpreter {
+            state: lc,
+            registers: vec![],
+            functions: vec![],
+            parent: None,
+        };
+
+        let result = interpreter.evaluate();
+        assert!(result.is_err(), "Expected MissingRegisterDigit error");
+        let err = result.unwrap_err();
+        assert!(matches!(err.kind, ErrorKind::MissingRegisterDigit { .. }));
+        assert!(
+            !err.backtrace.is_empty(),
+            "Expected backtrace to be present"
+        );
+    }
+
+    #[test]
+    fn test_missing_function_name_error() {
+        let lc = LinkedChars::from_iter("def { a => b }".chars());
+        let mut interpreter = Interpreter {
+            state: lc,
+            registers: vec![],
+            functions: vec![],
+            parent: None,
+        };
+
+        let result = interpreter.evaluate();
+        assert!(result.is_err(), "Expected MissingFunctionName error");
+        let err = result.unwrap_err();
+        assert!(matches!(err.kind, ErrorKind::MissingFunctionName { .. }));
+    }
+
+    #[test]
+    fn test_missing_function_body_error() {
+        let lc = LinkedChars::from_iter("def name".chars());
+        let mut interpreter = Interpreter {
+            state: lc,
+            registers: vec![],
+            functions: vec![],
+            parent: None,
+        };
+
+        let result = interpreter.evaluate();
+        assert!(result.is_err(), "Expected MissingFunctionBody error");
+        let err = result.unwrap_err();
+        assert!(matches!(err.kind, ErrorKind::MissingFunctionBody { .. }));
+    }
+
+    #[test]
+    fn test_undefined_function_error() {
+        let lc = LinkedChars::from_iter("foo()".chars());
+        let mut interpreter = Interpreter {
+            state: lc,
+            registers: vec![],
+            functions: vec![],
+            parent: None,
+        };
+
+        let result = interpreter.evaluate();
+        assert!(result.is_err(), "Expected UndefinedFunction error");
+        let err = result.unwrap_err();
+        assert!(matches!(err.kind, ErrorKind::UndefinedFunction { .. }));
+        assert!(
+            !err.backtrace.is_empty(),
+            "Expected backtrace to be present"
+        );
+    }
+
+    #[test]
+    fn test_register_out_of_bounds_error() {
+        let lc = LinkedChars::from_iter("{ a :: (a) => #3 }".chars());
+        let mut interpreter = Interpreter {
+            state: lc,
+            registers: vec![],
+            functions: vec![],
+            parent: None,
+        };
+
+        let result = interpreter.evaluate();
+        assert!(result.is_err(), "Expected RegisterOutOfBounds error");
+        let err = result.unwrap_err();
+        assert!(matches!(err.kind, ErrorKind::RegisterOutOfBounds { .. }));
+    }
+
+    #[test]
+    fn test_register_call_trailing_whitespace_is_ignored() {
+        let lc = LinkedChars::from_iter("{ a :: (a) => #1 1 }".chars());
+        let mut interpreter = Interpreter {
+            state: lc,
+            registers: vec![],
+            functions: vec![],
+            parent: None,
+        };
+
+        interpreter.evaluate().expect("Evaluation failed");
+        assert_eq!(interpreter.state.make_string().trim(), "a1");
+    }
+
+    #[test]
+    fn test_register_suggestion_from_parent() {
+        let lc = LinkedChars::from_iter("{ ab :: (a)(b) => { ok :: ok => #2 } }".chars());
+        let mut interpreter = Interpreter {
+            state: lc,
+            registers: vec![],
+            functions: vec![],
+            parent: None,
+        };
+
+        let result = interpreter.evaluate();
+        assert!(result.is_err(), "Expected RegisterOutOfBounds error");
+        let err = result.unwrap_err();
+        match err.kind {
+            ErrorKind::RegisterOutOfBounds { suggestion, .. } => {
+                assert_eq!(suggestion, Some("^#2".to_string()));
+            }
+            other => panic!("Unexpected error kind: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_register_index_starts_at_one() {
+        let lc = LinkedChars::from_iter("#0".chars());
+        let mut interpreter = Interpreter {
+            state: lc,
+            registers: vec![],
+            functions: vec![],
+            parent: None,
+        };
+
+        let result = interpreter.evaluate();
+        assert!(result.is_err(), "Expected RegisterIndexStartsAtOne error");
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err.kind,
+            ErrorKind::RegisterIndexStartsAtOne { .. }
+        ));
+    }
+
+    #[test]
+    fn test_missing_parent_scope_error() {
+        let lc = LinkedChars::from_iter("^^#1".chars());
+        let mut interpreter = Interpreter {
+            state: lc,
+            registers: vec![],
+            functions: vec![],
+            parent: None,
+        };
+
+        let result = interpreter.evaluate();
+        assert!(result.is_err(), "Expected MissingParentScope error");
+        let err = result.unwrap_err();
+        assert!(matches!(err.kind, ErrorKind::MissingParentScope { .. }));
     }
 }

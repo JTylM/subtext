@@ -1,3 +1,5 @@
+use crate::error::{ErrorKind, SubtextError};
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct CharNode {
     pub c: char,
@@ -16,7 +18,6 @@ pub struct LinkedChars {
 
 impl FromIterator<char> for LinkedChars {
     // Creates a new LinkedChars object from any iterator that yields characters.
-    // Highly useful for parsing strings into our custom linked list structure.
     fn from_iter<I: IntoIterator<Item = char>>(iter: I) -> Self {
         let mut linked_chars = Self {
             arena: vec![CharNode {
@@ -64,7 +65,7 @@ impl LinkedChars {
     }
 
     // Removes the sequence of nodes strictly BETWEEN start_idx and the node AFTER end_idx.
-    // NOTE: start_idx MUST be the index of the node immediately PRECEDING the sequence to be removed.
+    // start_idx MUST be the index of the node immediately PRECEDING the sequence to be removed.
     // end_idx is the last node that WILL be removed.
     pub fn remove_between(&mut self, start_idx: usize, end_idx: usize) {
         let next_after_end = self.get(end_idx).next;
@@ -88,6 +89,8 @@ impl LinkedChars {
         let mut last_node_added_idx = start_idx;
 
         // Iterate over the new text, clone it into our arena, and link it up
+        // TODO: getting rid of this clone might be worth it, this function is called often
+        // Do some profiling later
         for (_, node) in linked_chars.enumerate_with_start(0) {
             let mut new_node = node.clone();
             new_node.next = None;
@@ -101,25 +104,74 @@ impl LinkedChars {
         }
 
         // Connect the tail of the newly inserted chain to the rest of the original text
-        self.arena.last_mut().unwrap().next = next_after_end;
+        if let Some(last) = self.arena.last_mut() {
+            last.next = next_after_end;
+        }
     }
 
     // Returns the subinterval between start_idx and end_idx (non-inclusive of start, inclusive of end).
-    pub fn interval_to_string(&self, start_idx: usize, end_idx: usize) -> String {
+    pub fn interval_to_string(
+        &self,
+        start_idx: usize,
+        end_idx: usize,
+    ) -> Result<String, SubtextError> {
         let mut buffer = Vec::new();
         for (i, node) in self.enumerate_with_start(start_idx) {
             buffer.push(node.c);
             if i == end_idx {
-                return buffer.into_iter().collect();
+                return Ok(buffer.into_iter().collect());
             }
         }
-        panic!("end_idx was never found during interval_to_string");
+        Err(SubtextError::new(ErrorKind::InternalInvariant {
+            message: "end_idx was never found during interval_to_string".to_string(),
+        }))
     }
 
     pub fn make_string(&self) -> String {
         self.enumerate_with_start(0)
             .map(|(_i, node)| node.c)
             .collect::<String>()
+    }
+
+    pub fn index_to_char_pos(&self, target_idx: usize) -> Option<usize> {
+        for (pos, (i, _node)) in self.enumerate_with_start(0).enumerate() {
+            if i == target_idx {
+                return Some(pos);
+            }
+        }
+        None
+    }
+
+    // creates a snippet around an index of a given length. For printing helpful error messages,
+    // this should show the area around where an error occured
+    pub fn make_snippet(&self, highlight_idx: Option<usize>, max_len: usize) -> String {
+        let full: Vec<char> = self.enumerate_with_start(0).map(|(_, n)| n.c).collect();
+        if full.is_empty() {
+            return String::new();
+        }
+
+        let highlight_pos = highlight_idx.and_then(|idx| self.index_to_char_pos(idx));
+        let (start, end) = if full.len() <= max_len {
+            (0, full.len())
+        } else if let Some(pos) = highlight_pos {
+            let half = max_len / 2;
+            let start = pos.saturating_sub(half);
+            let end = usize::min(start + max_len, full.len());
+            (start, end)
+        } else {
+            (0, max_len)
+        };
+
+        let snippet: String = full[start..end].iter().collect();
+        if let Some(pos) = highlight_pos {
+            let caret_offset = pos.saturating_sub(start);
+            let mut caret_line = String::new();
+            caret_line.push_str(&" ".repeat(caret_offset));
+            caret_line.push('^');
+            format!("{}\n{}", snippet, caret_line)
+        } else {
+            snippet
+        }
     }
 
     // Returns an iterator that yields nodes starting AFTER the given start index.
@@ -180,7 +232,9 @@ mod tests {
 
         // start_idx 0 means we start reading AFTER the dummy node.
         // end_idx 3 means we stop exactly after reading 'c'.
-        let result = lc.interval_to_string(0, 3);
+        let result = lc
+            .interval_to_string(0, 3)
+            .expect("interval_to_string failed");
         assert_eq!(result, "abc", "Extracted string should match input");
     }
 
@@ -194,7 +248,9 @@ mod tests {
         lc.remove_between(1, 4);
 
         // Reconstruct full string starting after dummy (0) up to the last known node (5).
-        let result = lc.interval_to_string(0, 5);
+        let result = lc
+            .interval_to_string(0, 5)
+            .expect("interval_to_string failed");
         assert_eq!(result, "ho", "Expected 'ell' to be removed, leaving 'ho'");
     }
 
@@ -209,7 +265,9 @@ mod tests {
         lc.replace_between(1, 2, replacement);
 
         // Since we pushed 4 new nodes to the arena, the last node index is 2 + 4 = 6.
-        let result = lc.interval_to_string(0, 6);
+        let result = lc
+            .interval_to_string(0, 6)
+            .expect("interval_to_string failed");
         assert_eq!(
             result, "hello",
             "Expected 'hi' with 'i' replaced by 'ello' to yield 'hello'"
@@ -225,15 +283,44 @@ mod tests {
         // start_idx: 1 ('d'), end_idx: 5 ('t'). Next node is 6 ('e').
         lc.replace_between(1, 5, empty_replacement);
 
-        let result = lc.interval_to_string(0, 6);
+        let result = lc
+            .interval_to_string(0, 6)
+            .expect("interval_to_string failed");
         assert_eq!(result, "de", "Replacing with empty should leave 'de'");
     }
 
     #[test]
-    #[should_panic(expected = "end_idx was never found during interval_to_string")]
-    fn test_interval_to_string_panic_on_invalid_bounds() {
+    fn test_interval_to_string_error_on_invalid_bounds() {
         let lc = LinkedChars::from_iter("abc".chars());
         // Node 99 does not exist. The function should panic to prevent silent logic errors.
-        lc.interval_to_string(0, 99);
+        let result = lc.interval_to_string(0, 99);
+        assert!(
+            result.is_err(),
+            "Expected interval_to_string to return an error"
+        );
+    }
+
+    #[test]
+    fn test_index_to_char_pos() {
+        let lc = LinkedChars::from_iter("abcd".chars());
+        assert_eq!(lc.index_to_char_pos(1), Some(0));
+        assert_eq!(lc.index_to_char_pos(2), Some(1));
+        assert_eq!(lc.index_to_char_pos(4), Some(3));
+        assert_eq!(lc.index_to_char_pos(99), None);
+    }
+
+    #[test]
+    fn test_make_snippet_with_highlight() {
+        let lc = LinkedChars::from_iter("hello world".chars());
+        let snippet = lc.make_snippet(Some(6), 80);
+        assert!(snippet.contains("hello world"));
+        assert!(snippet.contains('^'));
+    }
+
+    #[test]
+    fn test_make_snippet_without_highlight() {
+        let lc = LinkedChars::from_iter("hello world".chars());
+        let snippet = lc.make_snippet(None, 5);
+        assert_eq!(snippet, "hello");
     }
 }
