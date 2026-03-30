@@ -15,7 +15,7 @@ def pred_digit {
 
 def pred {
         ^(\d*)0$     => pred(^#1)9
-    ||  (\d*)(\d)  => #1{pred_digit(^^#2) :: (\d) => #1}
+    ||  (\d*)(\d)  => #1{pred_digit(^^#2)}
 }
 
 def zeroes {
@@ -34,9 +34,9 @@ def mul_with_digit {
 }
 
 def mul_to_sum {
-        (\d*)\*(\d*)(\d)&(\d+)&(.*) => mul_to_sum(^#1*^#2&{add(^^^#4+1) :: (.*) => #1}&{mul_with_digit(^^^#3*^^^#1) :: (.*) => #1}{zeroes(^^^#4) :: (.*) => #1}+^#5)
+        (\d*)\*(\d*)(\d)&(\d+)&(.*) => mul_to_sum(^#1*^#2&{add(^^^#4+1)}&{mul_with_digit(^^^#3*^^^#1)}{zeroes(^^^#4)}+^#5)
     ||  (\d*)\*&(\d*)&(.*)          => #3
-    ||  (\d*)\*(\d*)(\d)            => mul_to_sum(^#1*^#2&1&{mul_with_digit(^^^#3*^^^#1) :: (.*) => #1})
+    ||  (\d*)\*(\d*)(\d)            => mul_to_sum(^#1*^#2&1&{mul_with_digit(^^^#3*^^^#1)})
 }
 
 def mul {
