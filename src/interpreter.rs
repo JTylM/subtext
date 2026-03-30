@@ -192,17 +192,6 @@ fn find_function_name(
 // TODO: move the pointers inwards by one for scopes and functions. At the moment we manually
 // remove the braces anyway later
 fn get_new_job(linked_chars: &LinkedChars, reader_idx: usize) -> Result<Job, SubtextError> {
-    // if the first char in linked chars is a ', we strip it and return immediately
-    // this enables us to, for example, to turn on evaluation insider patterns or put
-    // 'def f { .. } as the return of a function
-    if !linked_chars.is_empty() && linked_chars.get(1).c == '\'' {
-        return Ok(Job {
-            task: Task::Chill,
-            start: 0,
-            end: 1,
-        });
-    };
-
     let mut chars_buffer = Vec::new(); // Holds the read chars
 
     // Index to the char preceding the oldest non whitespace char we saw.
@@ -375,13 +364,8 @@ impl Interpreter<'_> {
             };
             reading_head = job.start; // always read the replacement back in 
             match job.task {
-                Task::Chill => {
-                    // we are done, but we will still remove everything between job.start and
-                    // job.end. If the chill came because we had a ' at the start of self.state,
-                    // then we want to remove that
-                    self.state.remove_between(job.start, job.end);
-                    break;
-                }
+                Task::Chill => break, // we are done
+
                 Task::Scope { content: scope } => {
                     // evaluate the scope
                     let result = evaluate_scope(scope, self)
@@ -823,7 +807,7 @@ mod tests {
     fn define_and_call_function_longer() {
         let lc = LinkedChars::from_iter(
             "def longer { 
-                    '(.*)(.)&(.*)(.) => longer(^#1&^#3)
+                    (.*)(.)&(.*)(.) => longer(^#1&^#3)
                 ||  .+&             => >
                 ||    &.+           => <
                 ||    &             => =}longer(abc&cde) longer(ab&c) longer(a&ab)"
@@ -841,7 +825,7 @@ mod tests {
 
     #[test]
     fn define_function_with_newlines() {
-        let lc = LinkedChars::from_iter("def\nf { a => ok } f(a)".chars());
+        let lc = LinkedChars::from_iter("def\nadd_positive { a => ok } add_positive(a)".chars());
         let mut interpreter = Interpreter {
             state: lc,
             registers: vec![],
@@ -941,7 +925,7 @@ mod tests {
 
     #[test]
     fn test_register_out_of_bounds_error() {
-        let lc = LinkedChars::from_iter("{ a :: '(a) => #3 }".chars());
+        let lc = LinkedChars::from_iter("{ a :: (a) => #3 }".chars());
         let mut interpreter = Interpreter {
             state: lc,
             registers: vec![],
@@ -957,7 +941,7 @@ mod tests {
 
     #[test]
     fn test_register_call_trailing_whitespace_is_ignored() {
-        let lc = LinkedChars::from_iter("{ a :: '(a) => #1 1 }".chars());
+        let lc = LinkedChars::from_iter("{ a :: (a) => #1 1 }".chars());
         let mut interpreter = Interpreter {
             state: lc,
             registers: vec![],
@@ -971,7 +955,7 @@ mod tests {
 
     #[test]
     fn test_register_suggestion_from_parent() {
-        let lc = LinkedChars::from_iter("{ ab :: '(a)(b) => { ok :: ok => #2 } }".chars());
+        let lc = LinkedChars::from_iter("{ ab :: (a)(b) => { ok :: ok => #2 } }".chars());
         let mut interpreter = Interpreter {
             state: lc,
             registers: vec![],
@@ -1023,18 +1007,5 @@ mod tests {
         assert!(result.is_err(), "Expected MissingParentScope error");
         let err = result.unwrap_err();
         assert!(matches!(err.kind, ErrorKind::MissingParentScope { .. }));
-    }
-
-    #[test]
-    fn test_delay_operator_define_function_globaly() {
-        let lc = LinkedChars::from_iter("{ :: => 'def f { => hello, world! }}f()".chars());
-        let mut interpreter = Interpreter {
-            state: lc,
-            registers: vec![],
-            functions: vec![],
-            parent: None,
-        };
-        let result = interpreter.evaluate();
-        assert_eq!(interpreter.state.make_string().trim(), "hello, world!");
     }
 }
