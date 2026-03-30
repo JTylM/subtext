@@ -45,6 +45,7 @@ def add {
             (\d*)(\d)\+(\d*)(\d)&?(c?)(\d*)     => add(^#1+^#3&{ sum_two_digits(^^^#2^^^#4^^^#5) :: (\d)(c?) => #2#1^^#6 })
     ||      (\d+)\+?&c(\d*)                     => add(^#1+1&^#2)
     ||      \+(\d+)&c(\d*)                      => add(^#1+1&^#2)
+    ||      \+&c(\d*)                           => 1#1
     ||      (\d+)\+?&?(\d*)                     => #1#2
     ||      \+(\d+)&?(\d*)                      => #1#2
     ||      (\d*)                               => #1
@@ -56,6 +57,11 @@ print_output(add(10+5))
 
 print_output(add(10000000+10000000))
 
+print_output(add(1+99))
+
+print_output(add(1+9))
+
+get_file(std/file_reading_test.st)
 
 
 
